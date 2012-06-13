@@ -1,6 +1,7 @@
 from cStringIO import StringIO
 
 import logging
+import re
 
 from teuthology import misc as teuthology
 from ..orchestra import run
@@ -21,6 +22,8 @@ def normalize_config(ctx, config):
            tag: v3.0
          osd.1:
            branch: new_btrfs
+         osd.3:
+           deb: /path/to/linux-whatever.deb
 
     is transformed into::
 
@@ -30,12 +33,18 @@ def normalize_config(ctx, config):
            branch: new_btrfs
          osd.2:
            tag: v3.0
+         osd.3:
+           deb: /path/to/linux-whatever.deb
 
     If config is None or just specifies a version to use,
     it is applied to all nodes.
     """
     if config is None or \
-            len(config) == 1 and config.keys() in [['tag'], ['branch'], ['sha1']]:
+            len(config) == 1 and config.keys() in [['tag'],
+                                                   ['branch'],
+                                                   ['sha1'],
+                                                   ['deb'],
+                                                   ['path']]:
         new_config = {}
         if config is None:
             config = {'branch': 'master'}
@@ -137,6 +146,71 @@ def install_firmware(ctx, config):
                 ],
             )
 
+def build_local(ctx, paths):
+    for path in config.iterkeys():
+        log.info('Building kernel deb in %s', path)
+        subprocess.check_call(
+            args=[
+                'make',
+                'deb-pkg',
+                ],
+            cwd=path,
+            )
+
+def download_deb(ctx, config):
+    procs = {}
+    for role, sha1 in config.iteritems():
+        (role_remote,) = ctx.cluster.only(role).remotes.keys()
+        if sha1.find('/') >= 0:
+            # local deb
+            log.info('Copying kernel deb {path} to {role}...'.format(path=sha1,
+                                                                     role=role))
+            f = open(sha1, 'r')
+            proc = role_remote.run(
+                args=[
+                    'python', '-c',
+                    'import shutil, sys; shutil.copyfileobj(sys.stdin, file(sys.argv[1], "wb"))',
+                    '/tmp/linux-image.deb',
+                    ],
+                wait=False,
+                stdin=f
+                )
+            procs[role_remote.name] = proc
+
+        else:
+            log.info('Downloading kernel {sha1} on {role}...'.format(sha1=sha1,
+                                                                     role=role))
+            _, deb_url = teuthology.get_ceph_binary_url(
+                package='kernel',
+                sha1=sha1, 
+                format='deb',
+                flavor='basic',
+                arch='x86_64',
+                dist='precise',
+                )
+
+            log.info('fetching kernel from {url}'.format(url=deb_url))
+            proc = role_remote.run(
+                args=[
+                    'sudo', 'rm', '-f', '/tmp/linux-image.deb',
+                    run.Raw('&&'),
+                    'echo',
+                    'linux-image.deb',
+                    run.Raw('|'),
+                    'wget',
+                    '-nv',
+                    '-O',
+                    '/tmp/linux-image.deb',
+                    '--base={url}'.format(url=deb_url),
+                    '--input-file=-',
+                    ],
+                wait=False)
+            procs[role_remote.name] = proc
+
+    for name, proc in procs.iteritems():
+        log.debug('Waiting for download/copy to %s to complete...', name)
+        proc.exitstatus.get()
+
 
 def install_and_reboot(ctx, config):
     procs = {}
@@ -144,27 +218,8 @@ def install_and_reboot(ctx, config):
         log.info('Installing kernel version {sha1} on {role}...'.format(sha1=sha1,
                                                                         role=role))
         (role_remote,) = ctx.cluster.only(role).remotes.keys()
-        _, deb_url = teuthology.get_ceph_binary_url(
-            package='kernel',
-            sha1=sha1, 
-            format='deb',
-            flavor='basic',
-            arch='x86_64',
-            dist='precise',
-            )
-        log.info('fetching kernel from {url}'.format(url=deb_url))
         proc = role_remote.run(
             args=[
-                'echo',
-                'linux-image.deb',
-                run.Raw('|'),
-                'wget',
-                '-nv',
-                '-O',
-                '/tmp/linux-image.deb',
-                '--base={url}'.format(url=deb_url),
-                '--input-file=-',
-                run.Raw('&&'),
                 'sudo',
                 'dpkg',
                 '-i',
@@ -306,22 +361,35 @@ def task(ctx, config):
 
     need_install = {}
     for role, role_config in config.iteritems():
-        sha1, _ = teuthology.get_ceph_binary_url(
-            package='kernel',
-            branch=role_config.get('branch'),
-            tag=role_config.get('tag'),
-            sha1=role_config.get('sha1'),
-            flavor='basic',
-            format='deb',
-            dist='precise',
-            arch='x86_64',
-            )
-        log.debug('sha1 for {role} is {sha1}'.format(role=role, sha1=sha1))
-        ctx.summary['{role}-kernel-sha1'.format(role=role)] = sha1
-        if need_to_install(ctx, role, sha1):
-            need_install[role] = sha1
+        if role_config.get('deb'):
+            path = role_config.get('deb')
+            match = re.search('\d+-g(\w{7})', path)
+            if match:
+                sha1 = match.group(1) 
+                log.info('kernel deb sha1 appears to be %s', sha1)
+                if need_to_install(ctx, role, sha1):
+                    need_install[role] = path
+            else:
+                log.info('unable to extract sha1 from deb path, forcing install')
+                need_install[role] = path
+        else:
+            sha1, _ = teuthology.get_ceph_binary_url(
+                package='kernel',
+                branch=role_config.get('branch'),
+                tag=role_config.get('tag'),
+                sha1=role_config.get('sha1'),
+                flavor='basic',
+                format='deb',
+                dist='precise',
+                arch='x86_64',
+                )
+            log.debug('sha1 for {role} is {sha1}'.format(role=role, sha1=sha1))
+            ctx.summary['{role}-kernel-sha1'.format(role=role)] = sha1
+            if need_to_install(ctx, role, sha1):
+                need_install[role] = sha1
 
     if need_install:
         install_firmware(ctx, need_install)
+        download_deb(ctx, need_install)
         install_and_reboot(ctx, need_install)
         wait_for_reboot(ctx, need_install, timeout)

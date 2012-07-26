@@ -158,6 +158,15 @@ def task(ctx, config):
             ])
     assert not err
 
+    # TESTCASE 'add-s3-key', 'key', 'create', 'S3 key', 'fails'
+    (err, out) = rgwadmin(ctx, client, [
+            'subuser', 'create', '--subuser', subuser2,
+            '--access-key', access_key2,
+            '--secret', secret_key2,
+            '--key-type', 'S3',
+            ])
+    assert err
+
     # TESTCASE 'info-swift-key','user','info','after key addition','returns all keys'
     (err, out) = rgwadmin(ctx, client, ['user', 'info', '--uid', user])
     assert not err
@@ -380,8 +389,11 @@ def task(ctx, config):
     key.delete()
     bucket.delete()
     
-    # TESTCASE 'rm-user','user','rm','existing user','fails, still has buckets'
-    (err, out) = rgwadmin(ctx, client, ['user', 'rm', '--uid', user])
+    # TESTCASE 'rm-user','user','rm','existing user','succeeds with purge-data flag'
+    (err, out) = rgwadmin(ctx, client, [
+    'user', 'rm', '--uid', user,
+    '--purge-data'
+    ])
     assert not err
 
     # TESTCASE 'rm-user2','user','rm','deleted user','fails'

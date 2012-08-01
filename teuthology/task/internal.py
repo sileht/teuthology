@@ -134,7 +134,8 @@ def connect(ctx, config):
     from ..orchestra import connection, remote
     from ..orchestra import cluster
     remotes = []
-    for t, key in ctx.config['targets'].iteritems():
+    for t in sorted(ctx.config['targets'].keys()):
+        key = ctx.config['targets'][t]
         log.debug('connecting to %s', t)
         remotes.append(
             remote.Remote(name=t,
